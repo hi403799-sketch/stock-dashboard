@@ -2,3 +2,4 @@ streamlit
 pykrx
 pandas
 requests
+yfinance

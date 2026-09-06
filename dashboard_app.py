@@ -2,10 +2,10 @@
 """
 관심 종목을 검색해서 추가하고, 종목마다 다른 조건(이동평균 근접, 직전 고점 돌파,
 목표가 도달)을 설정한 뒤, 현재가가 그 조건에 얼마나 가까운지 실시간에 가깝게
-보여주는 웹 대시보드입니다.
+보여주는 웹 대시보드입니다. 국내 주식, 미국 주식, 코인을 모두 등록할 수 있습니다.
 
 [사전 준비]
-pip install streamlit pykrx pandas requests
+pip install streamlit pykrx pandas requests yfinance
 
 [실행 방법]
 1. 명령 프롬프트에서 이 파일이 있는 폴더로 이동 (예: cd Downloads)
@@ -20,10 +20,9 @@ pip install streamlit pykrx pandas requests
 그 토픽 이름을 입력하면 조건 달성 시 폰으로 알림이 옵니다.
 
 [참고]
-- 현재가: 네이버 금융의 실시간 시세를 가져옵니다 (장중 수십 초 이내 지연 수준).
+- 국내 주식 현재가: 네이버 금융의 실시간 시세를 가져옵니다 (장중 수십 초 이내 지연).
+- 미국 주식 현재가: yfinance(야후 파이낸스)를 통해 가져옵니다 (보통 몇 분 내외 지연).
 - 이동평균/직전 고점: 전일까지의 일봉(종가/고가) 기준으로 계산됩니다.
-- 첫 실행 시 종목 검색을 위한 전체 종목 목록을 한 번 불러오는데,
-  1~2분 정도 걸릴 수 있습니다. 이후에는 파일로 저장되어 빠르게 뜹니다.
 """
 
 import json
@@ -34,6 +33,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import requests
 import streamlit as st
+import yfinance as yf
 from pykrx import stock
 
 # ==================================================================
@@ -51,6 +51,21 @@ CONDITION_NAMES = {
     "prior_high": "직전 고점 돌파",
     "target_price": "목표가 도달",
 }
+
+CURRENCY_SYMBOL = {"KR": "원", "US": "$", "COIN": "$"}
+
+
+def format_price(value, market):
+    """시장에 맞는 통화 표시로 가격을 포맷한다."""
+    if value is None:
+        return "-"
+    if market == "KR":
+        return f"{value:,.0f}원"
+    # 미국주식/코인: 가격이 작은 알트코인 등을 고려해 자릿수를 유동적으로
+    decimals = 2 if value >= 1 else 6
+    if market == "COIN":
+        return f"{value:,.{decimals}f} USDT"
+    return f"${value:,.{decimals}f}"
 
 
 # ==================================================================
@@ -85,9 +100,10 @@ if "notified" not in st.session_state:
 
 
 # ==================================================================
-# 실시간 현재가 조회 (네이버 금융 시세 API, 여러 종목 한 번에 조회)
+# 실시간 현재가 조회
 # ==================================================================
-def get_current_prices(tickers):
+def get_current_prices_kr(tickers):
+    """네이버 금융 시세 API로 국내 주식 현재가를 한 번에 조회"""
     if not tickers:
         return {}
     codes = ",".join(tickers)
@@ -96,7 +112,7 @@ def get_current_prices(tickers):
         resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
         datas = resp.json().get("datas", [])
     except Exception as e:
-        st.warning(f"실시간 시세 조회에 실패했습니다: {e}")
+        st.warning(f"국내 주식 시세 조회에 실패했습니다: {e}")
         return {}
 
     result = {}
@@ -115,11 +131,50 @@ def get_current_prices(tickers):
     return result
 
 
+def get_current_prices_binance(tickers):
+    """바이낸스 공개 API로 USDT 마켓 현재가를 한 번에 조회"""
+    result = {}
+    if not tickers:
+        return result
+    url = "https://api.binance.com/api/v3/ticker/price"
+    try:
+        resp = requests.get(
+            url, params={"symbols": json.dumps(tickers)}, timeout=5
+        )
+        data = resp.json()
+    except Exception as e:
+        st.warning(f"바이낸스 시세 조회에 실패했습니다: {e}")
+        return result
+
+    if not isinstance(data, list):
+        return result
+
+    for item in data:
+        try:
+            result[item["symbol"]] = {"price": float(item["price"]), "market_status": "-"}
+        except (KeyError, ValueError, TypeError):
+            continue
+    return result
+
+
+def get_current_prices(watchlist):
+    """종목의 market 값에 따라 국내(네이버) / 미국(yfinance) / 코인(바이낸스)으로 나눠서 조회 후 합침"""
+    kr_tickers = [w["ticker"] for w in watchlist if w.get("market", "KR") == "KR"]
+    us_tickers = [w["ticker"] for w in watchlist if w.get("market", "KR") == "US"]
+    coin_tickers = [w["ticker"] for w in watchlist if w.get("market", "KR") == "COIN"]
+    prices = {}
+    prices.update(get_current_prices_kr(kr_tickers))
+    prices.update(get_current_prices_us(us_tickers))
+    prices.update(get_current_prices_binance(coin_tickers))
+    return prices
+
+
 # ==================================================================
 # 일봉 데이터 조회 (이동평균/고점 계산용, 1시간 캐시 - 장중에 자주 안 바뀜)
+# close/high 컬럼명으로 통일해서 국내/미국/코인 데이터를 동일하게 다룬다.
 # ==================================================================
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_history(ticker, lookback_days):
+def get_history_kr(ticker, lookback_days):
     start = (datetime.now() - timedelta(days=lookback_days * 2 + 30)).strftime("%Y%m%d")
     end = datetime.now().strftime("%Y%m%d")
     try:
@@ -127,17 +182,79 @@ def get_history(ticker, lookback_days):
     except Exception:
         return pd.DataFrame()
 
+    if df.empty:
+        return df
+
     # 이평/고점은 항상 '확정된 전일까지의 종가' 기준으로만 계산하기 위해
     # 혹시 오늘 날짜 데이터가 섞여 있으면 확실히 제외한다.
-    if not df.empty:
-        today_str = datetime.now().strftime("%Y%m%d")
-        df = df[df.index.strftime("%Y%m%d") != today_str]
-    return df
+    today_str = datetime.now().strftime("%Y%m%d")
+    df = df[df.index.strftime("%Y%m%d") != today_str]
+    return df.rename(columns={"종가": "close", "고가": "high"})
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_history_us(ticker, lookback_days):
+    start = (datetime.now() - timedelta(days=lookback_days * 2 + 30)).strftime("%Y-%m-%d")
+    end = datetime.now().strftime("%Y-%m-%d")
+    try:
+        df = yf.Ticker(ticker).history(start=start, end=end)
+    except Exception:
+        return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    df = df[df.index.strftime("%Y-%m-%d") != today_str]
+    return df.rename(columns={"Close": "close", "High": "high"})
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_history_binance(ticker, lookback_days):
+    """바이낸스 일봉(1d 캔들) 데이터 조회 (최대 1000개)"""
+    limit = min(lookback_days * 2 + 30, 1000)
+    url = "https://api.binance.com/api/v3/klines"
+    try:
+        resp = requests.get(
+            url, params={"symbol": ticker, "interval": "1d", "limit": limit}, timeout=5
+        )
+        data = resp.json()
+    except Exception:
+        return pd.DataFrame()
+
+    if not isinstance(data, list) or not data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(
+        data,
+        columns=[
+            "open_time", "open", "high", "low", "close", "volume", "close_time",
+            "quote_asset_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore",
+        ],
+    )
+    df["close"] = df["close"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["date"] = pd.to_datetime(df["open_time"], unit="ms")
+    df = df.set_index("date")
+
+    # 코인은 24시간 거래라 '오늘'을 UTC 자정 기준으로 판단해서 미확정 캔들을 제외한다.
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    df = df[df.index.strftime("%Y-%m-%d") != today_str]
+    return df[["close", "high"]]
+
+
+def get_history(ticker, market, lookback_days):
+    if market == "KR":
+        return get_history_kr(ticker, lookback_days)
+    if market == "COIN":
+        return get_history_binance(ticker, lookback_days)
+    return get_history_us(ticker, lookback_days)
 
 
 def get_reference_value(item):
     """조건별 '기준값' 계산 (이평값, 직전 고점, 목표가)"""
     condition = item["condition"]
+    market = item.get("market", "KR")
 
     if condition == "target_price":
         return item["target_price"]
@@ -154,21 +271,21 @@ def get_reference_value(item):
         else:
             fetch_days = period
 
-        df = get_history(item["ticker"], fetch_days)
+        df = get_history(item["ticker"], market, fetch_days)
         if df.empty or len(df) < period:
             return None
 
         if ma_type == "EMA":
-            return df["종가"].ewm(span=period, adjust=False).mean().iloc[-1]
-        return df["종가"].rolling(period).mean().iloc[-1]
+            return df["close"].ewm(span=period, adjust=False).mean().iloc[-1]
+        return df["close"].rolling(period).mean().iloc[-1]
 
     if condition == "prior_high":
         period = item["lookback_days"]
-        df = get_history(item["ticker"], period)
+        df = get_history(item["ticker"], market, period)
         if df.empty:
             return None
         recent = df.iloc[-period:] if len(df) >= period else df
-        return recent["고가"].max()
+        return recent["high"].max()
 
     return None
 
@@ -176,12 +293,13 @@ def get_reference_value(item):
 def get_condition_label(item):
     """표에 표시할 조건 설명 문구를 만든다."""
     condition = item["condition"]
+    market = item.get("market", "KR")
     if condition == "ma_touch":
         return f"{item['ma_period']}일 {item.get('ma_type', 'SMA')} 근접"
     if condition == "prior_high":
         return f"최근 {item['lookback_days']}일 고점 돌파"
     if condition == "target_price":
-        return f"목표가 {item['target_price']:,}원"
+        return f"목표가 {format_price(item['target_price'], market)}"
     return CONDITION_NAMES.get(condition, condition)
 
 
@@ -192,8 +310,12 @@ def send_notification(item, current, ref, diff_pct):
     topic = st.session_state.config.get("ntfy_topic", "").strip()
     if not topic:
         return
+    market = item.get("market", "KR")
     title = f"{item['name']} - {get_condition_label(item)}"
-    message = f"현재가 {current:,}원 / 기준값 {ref:,.0f}원 (차이 {diff_pct:+.2f}%)"
+    message = (
+        f"현재가 {format_price(current, market)} / "
+        f"기준값 {format_price(ref, market)} (차이 {diff_pct:+.2f}%)"
+    )
     try:
         requests.post(
             f"https://ntfy.sh/{topic}",
@@ -220,20 +342,43 @@ if topic_input != st.session_state.config.get("ntfy_topic"):
 # 사이드바: 종목 추가
 # ==================================================================
 st.sidebar.header("➕ 종목 추가")
-st.sidebar.caption(
-    "네이버 금융(finance.naver.com)에서 종목 검색 후, "
-    "주소창에 보이는 6자리 숫자를 코드로 입력하세요."
-)
 
-ticker_input = st.sidebar.text_input("종목 코드 (6자리 숫자)", key="ticker_box")
+market_choice = st.sidebar.radio("시장 선택", ["국내", "미국", "코인"], horizontal=True)
+market_code = {"국내": "KR", "미국": "US", "코인": "COIN"}[market_choice]
+
+if market_code == "KR":
+    st.sidebar.caption(
+        "네이버 금융(finance.naver.com)에서 종목 검색 후, "
+        "주소창에 보이는 6자리 숫자를 코드로 입력하세요."
+    )
+    ticker_input = st.sidebar.text_input("종목 코드 (6자리 숫자)", key="ticker_box_kr")
+elif market_code == "US":
+    st.sidebar.caption("예: 애플=AAPL, 테슬라=TSLA, 엔비디아=NVDA")
+    ticker_input = st.sidebar.text_input("티커(symbol)", key="ticker_box_us")
+else:
+    st.sidebar.caption("코인 이름만 입력하면 바이낸스 USDT 마켓 시세를 가져와요. 예: BTC, ETH, SOL")
+    ticker_input = st.sidebar.text_input("코인 심볼", key="ticker_box_coin")
+
 name_input = st.sidebar.text_input("표시할 종목명 (자유롭게 입력)", key="name_box")
 
 if ticker_input:
     ticker_clean = ticker_input.strip()
-    valid_code = ticker_clean.isdigit() and len(ticker_clean) == 6
+    if market_code == "KR":
+        valid_code = ticker_clean.isdigit() and len(ticker_clean) == 6
+        invalid_msg = "코드는 숫자 6자리여야 해요. (예: 005930)"
+    elif market_code == "US":
+        ticker_clean = ticker_clean.upper()
+        valid_code = ticker_clean.isalpha() or ("." in ticker_clean or "-" in ticker_clean)
+        invalid_msg = "영문 티커를 입력해주세요. (예: AAPL, TSLA)"
+    else:  # COIN
+        ticker_clean = ticker_clean.upper()
+        if not ticker_clean.endswith("USDT"):
+            ticker_clean = f"{ticker_clean}USDT"
+        valid_code = True
+        invalid_msg = ""
 
     if not valid_code:
-        st.sidebar.warning("코드는 숫자 6자리여야 해요. (예: 005930)")
+        st.sidebar.warning(invalid_msg)
     else:
         display_name = name_input.strip() if name_input.strip() else ticker_clean
 
@@ -243,7 +388,12 @@ if ticker_input:
             format_func=lambda x: CONDITION_NAMES[x],
         )
 
-        new_item = {"ticker": ticker_clean, "name": display_name, "condition": condition_type}
+        new_item = {
+            "ticker": ticker_clean,
+            "name": display_name,
+            "market": market_code,
+            "condition": condition_type,
+        }
 
         if condition_type == "ma_touch":
             new_item["ma_period"] = st.sidebar.number_input("이동평균 기간(일)", 5, 300, 50)
@@ -259,8 +409,11 @@ if ticker_input:
                 "근접 기준(±%)", 0.1, 10.0, 1.0
             )
         elif condition_type == "target_price":
+            price_label = {"KR": "목표가(원)", "US": "목표가($)", "COIN": "목표가(USDT)"}[
+                market_code
+            ]
             new_item["target_price"] = st.sidebar.number_input(
-                "목표가(원)", min_value=0, step=100
+                price_label, min_value=0.0, step=100.0 if market_code == "KR" else 1.0
             )
             new_item["threshold_pct"] = st.sidebar.number_input(
                 "근접 기준(±%)", 0.1, 10.0, 1.0
@@ -279,7 +432,8 @@ if st.session_state.watchlist:
     st.sidebar.header("📋 등록된 종목")
     for i, item in enumerate(st.session_state.watchlist):
         col1, col2 = st.sidebar.columns([3, 1])
-        col1.write(f"{item['name']} · {get_condition_label(item)}")
+        flag = {"KR": "🇰🇷", "US": "🇺🇸", "COIN": "🪙"}.get(item.get("market", "KR"), "🇰🇷")
+        col1.write(f"{flag} {item['name']} · {get_condition_label(item)}")
         if col2.button("삭제", key=f"del_{i}"):
             st.session_state.watchlist.pop(i)
             save_json(WATCHLIST_FILE, st.session_state.watchlist)
@@ -298,12 +452,12 @@ watchlist = st.session_state.watchlist
 if not watchlist:
     st.info("왼쪽 사이드바에서 종목을 검색해 추가해보세요.")
 else:
-    tickers = [w["ticker"] for w in watchlist]
-    prices = get_current_prices(tickers)
+    prices = get_current_prices(watchlist)
 
     rows = []
     for item in watchlist:
         ticker = item["ticker"]
+        market = item.get("market", "KR")
         price_info = prices.get(ticker, {})
         current = price_info.get("price")
         market_status = price_info.get("market_status", "-")
@@ -323,7 +477,7 @@ else:
             achieved = abs(diff_pct) <= threshold
 
         # 중복 알림 방지: "미달성 -> 달성"으로 바뀌는 순간에만 알림 발송
-        key = f"{ticker}_{item['condition']}"
+        key = f"{market}_{ticker}_{item['condition']}"
         was_achieved = st.session_state.notified.get(key, False)
         if achieved and not was_achieved and diff_pct is not None:
             send_notification(item, current, ref, diff_pct)
@@ -331,11 +485,14 @@ else:
 
         rows.append(
             {
+                "시장": {"KR": "🇰🇷 국내", "US": "🇺🇸 미국", "COIN": "🪙 코인"}.get(
+                    market, "🇰🇷 국내"
+                ),
                 "종목명": item["name"],
-                "현재가": f"{current:,}원" if current else "조회 실패",
-                "시장상태": "장중" if market_status == "OPEN" else "장마감",
+                "현재가": format_price(current, market) if current is not None else "조회 실패",
+                "시장상태": "장중" if market_status == "OPEN" else "-",
                 "조건": get_condition_label(item),
-                "기준값": f"{ref:,.0f}원" if ref else "-",
+                "기준값": format_price(ref, market),
                 "차이": f"{diff_pct:+.2f}%" if diff_pct is not None else "-",
                 "상태": "🔔 조건 도달" if achieved else "관찰중",
             }
