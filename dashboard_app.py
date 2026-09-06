@@ -87,7 +87,7 @@ def save_json(path, data):
 if "watchlist" not in st.session_state:
     st.session_state.watchlist = load_json(WATCHLIST_FILE, [])
 if "config" not in st.session_state:
-    st.session_state.config = load_json(CONFIG_FILE, {"ntfy_topic": ""})
+    st.session_state.config = load_json(CONFIG_FILE, {"ntfy_topic": "", "coingecko_api_key": ""})
 if "notified" not in st.session_state:
     st.session_state.notified = {}  # 중복 알림 방지용: {종목+조건 키: 이미 달성 여부}
 
@@ -144,6 +144,15 @@ def get_current_prices_us(tickers):
     return result
 
 
+def get_coingecko_headers():
+    """설정된 코인게코 Demo API 키가 있으면 헤더에 포함시킨다. (없으면 훨씬 낮은 무료 한도로 동작)"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    api_key = st.session_state.config.get("coingecko_api_key", "").strip()
+    if api_key:
+        headers["x-cg-demo-api-key"] = api_key
+    return headers
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def search_coingecko_id(query):
     """코인 심볼/이름으로 코인게코 coin id를 찾는다. (예: 'BTC' -> 'bitcoin')"""
@@ -151,7 +160,7 @@ def search_coingecko_id(query):
         return None
     url = "https://api.coingecko.com/api/v3/search"
     try:
-        resp = requests.get(url, params={"query": query}, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        resp = requests.get(url, params={"query": query}, headers=get_coingecko_headers(), timeout=5)
         coins = resp.json().get("coins", [])
     except Exception:
         return None
@@ -179,7 +188,7 @@ def get_current_prices_coingecko(coin_ids):
         resp = requests.get(
             url,
             params={"ids": ",".join(coin_ids), "vs_currencies": "usd"},
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers=get_coingecko_headers(),
             timeout=5,
         )
         data = resp.json()
@@ -187,7 +196,16 @@ def get_current_prices_coingecko(coin_ids):
         st.warning(f"코인 시세 조회에 실패했습니다: {e}")
         return result
 
+    if not isinstance(data, dict) or "coins" not in data and any(
+        k in data for k in ("status", "error")
+    ):
+        # 요청 실패(레이트리밋 등) 응답 형태인 경우
+        st.warning("코인게코 응답에 오류가 있어요. API 키를 등록했는지, 요청이 너무 잦지 않은지 확인해보세요.")
+        return result
+
     for coin_id, values in data.items():
+        if not isinstance(values, dict):
+            continue
         price = values.get("usd")
         result[coin_id] = {"price": price, "market_status": "-"}
     return result
@@ -256,7 +274,7 @@ def get_history_coingecko(coin_id, lookback_days):
         resp = requests.get(
             url,
             params={"vs_currency": "usd", "days": days},
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers=get_coingecko_headers(),
             timeout=10,
         )
         prices = resp.json().get("prices", [])
@@ -382,6 +400,21 @@ topic_input = st.sidebar.text_input(
 )
 if topic_input != st.session_state.config.get("ntfy_topic"):
     st.session_state.config["ntfy_topic"] = topic_input
+    save_json(CONFIG_FILE, st.session_state.config)
+
+st.sidebar.header("🪙 코인 시세 설정")
+st.sidebar.caption(
+    "코인게코 무료 API는 키 없이는 자주 실패해요. "
+    "[Demo API 키](https://www.coingecko.com/en/developers/dashboard)를 "
+    "무료로 발급받아 입력하면 훨씬 안정적으로 조회돼요."
+)
+coingecko_key_input = st.sidebar.text_input(
+    "코인게코 API 키 (CG-로 시작)",
+    value=st.session_state.config.get("coingecko_api_key", ""),
+    type="password",
+)
+if coingecko_key_input != st.session_state.config.get("coingecko_api_key"):
+    st.session_state.config["coingecko_api_key"] = coingecko_key_input
     save_json(CONFIG_FILE, st.session_state.config)
 
 # ==================================================================
