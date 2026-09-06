@@ -131,6 +131,21 @@ def get_current_prices_kr(tickers):
     return result
 
 
+def get_current_prices_us(tickers):
+    """yfinance로 미국 주식 현재가를 조회 (보통 몇 분 내외 지연)"""
+    result = {}
+    if not tickers:
+        return result
+    for t in tickers:
+        try:
+            fast_info = yf.Ticker(t).fast_info
+            price = fast_info.get("lastPrice") or fast_info.get("last_price")
+            result[t] = {"price": round(price, 2) if price else None, "market_status": "-"}
+        except Exception:
+            result[t] = {"price": None, "market_status": "-"}
+    return result
+
+
 def get_current_prices_binance(tickers):
     """바이낸스 공개 API로 USDT 마켓 현재가를 한 번에 조회"""
     result = {}
