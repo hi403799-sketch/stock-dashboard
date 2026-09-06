@@ -144,10 +144,20 @@ def get_current_prices_us(tickers):
     return result
 
 
+def get_secret_coingecko_key():
+    """Streamlit Cloud의 Secrets에 저장된 키가 있으면 반환 (재배포/재시작해도 안 사라짐)"""
+    try:
+        return st.secrets.get("coingecko_api_key", "")
+    except Exception:
+        return ""
+
+
 def get_coingecko_headers():
-    """설정된 코인게코 Demo API 키가 있으면 헤더에 포함시킨다. (없으면 훨씬 낮은 무료 한도로 동작)"""
+    """설정된 코인게코 Demo API 키가 있으면 헤더에 포함시킨다.
+    우선순위: 사이드바에 직접 입력한 값 > Streamlit Secrets에 저장된 값
+    (없으면 훨씬 낮은 무료 한도로 동작)"""
     headers = {"User-Agent": "Mozilla/5.0"}
-    api_key = st.session_state.config.get("coingecko_api_key", "").strip()
+    api_key = st.session_state.config.get("coingecko_api_key", "").strip() or get_secret_coingecko_key()
     if api_key:
         headers["x-cg-demo-api-key"] = api_key
     return headers
@@ -408,14 +418,17 @@ st.sidebar.caption(
     "[Demo API 키](https://www.coingecko.com/en/developers/dashboard)를 "
     "무료로 발급받아 입력하면 훨씬 안정적으로 조회돼요."
 )
-coingecko_key_input = st.sidebar.text_input(
-    "코인게코 API 키 (CG-로 시작)",
-    value=st.session_state.config.get("coingecko_api_key", ""),
-    type="password",
-)
-if coingecko_key_input != st.session_state.config.get("coingecko_api_key"):
-    st.session_state.config["coingecko_api_key"] = coingecko_key_input
-    save_json(CONFIG_FILE, st.session_state.config)
+if get_secret_coingecko_key():
+    st.sidebar.success("✅ Secrets에 저장된 API 키를 사용 중이에요. (재배포해도 유지됨)")
+else:
+    coingecko_key_input = st.sidebar.text_input(
+        "코인게코 API 키 (CG-로 시작)",
+        value=st.session_state.config.get("coingecko_api_key", ""),
+        type="password",
+    )
+    if coingecko_key_input != st.session_state.config.get("coingecko_api_key"):
+        st.session_state.config["coingecko_api_key"] = coingecko_key_input
+        save_json(CONFIG_FILE, st.session_state.config)
 
 # ==================================================================
 # 사이드바: 종목 추가
