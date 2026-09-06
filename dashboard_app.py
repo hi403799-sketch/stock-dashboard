@@ -63,8 +63,6 @@ def format_price(value, market):
         return f"{value:,.0f}원"
     # 미국주식/코인: 가격이 작은 알트코인 등을 고려해 자릿수를 유동적으로
     decimals = 2 if value >= 1 else 6
-    if market == "COIN":
-        return f"{value:,.{decimals}f} USDT"
     return f"${value:,.{decimals}f}"
 
 
@@ -146,41 +144,64 @@ def get_current_prices_us(tickers):
     return result
 
 
-def get_current_prices_binance(tickers):
-    """바이낸스 공개 API로 USDT 마켓 현재가를 한 번에 조회"""
+@st.cache_data(ttl=86400, show_spinner=False)
+def search_coingecko_id(query):
+    """코인 심볼/이름으로 코인게코 coin id를 찾는다. (예: 'BTC' -> 'bitcoin')"""
+    if not query:
+        return None
+    url = "https://api.coingecko.com/api/v3/search"
+    try:
+        resp = requests.get(url, params={"query": query}, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        coins = resp.json().get("coins", [])
+    except Exception:
+        return None
+
+    if not coins:
+        return None
+
+    query_lower = query.strip().lower()
+    # 심볼이 정확히 일치하는 것을 최우선으로 선택 (예: 'HYPE' -> Hyperliquid)
+    for c in coins:
+        if c.get("symbol", "").lower() == query_lower:
+            return {"id": c["id"], "name": c.get("name", c["id"]), "symbol": c.get("symbol", "")}
+    # 정확히 일치하는 게 없으면 검색 결과 1순위 사용
+    c = coins[0]
+    return {"id": c["id"], "name": c.get("name", c["id"]), "symbol": c.get("symbol", "")}
+
+
+def get_current_prices_coingecko(coin_ids):
+    """코인게코 공개 API로 USD 기준 현재가를 한 번에 조회"""
     result = {}
-    if not tickers:
+    if not coin_ids:
         return result
-    url = "https://api.binance.com/api/v3/ticker/price"
+    url = "https://api.coingecko.com/api/v3/simple/price"
     try:
         resp = requests.get(
-            url, params={"symbols": json.dumps(tickers)}, timeout=5
+            url,
+            params={"ids": ",".join(coin_ids), "vs_currencies": "usd"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=5,
         )
         data = resp.json()
     except Exception as e:
-        st.warning(f"바이낸스 시세 조회에 실패했습니다: {e}")
+        st.warning(f"코인 시세 조회에 실패했습니다: {e}")
         return result
 
-    if not isinstance(data, list):
-        return result
-
-    for item in data:
-        try:
-            result[item["symbol"]] = {"price": float(item["price"]), "market_status": "-"}
-        except (KeyError, ValueError, TypeError):
-            continue
+    for coin_id, values in data.items():
+        price = values.get("usd")
+        result[coin_id] = {"price": price, "market_status": "-"}
     return result
 
 
 def get_current_prices(watchlist):
-    """종목의 market 값에 따라 국내(네이버) / 미국(yfinance) / 코인(바이낸스)으로 나눠서 조회 후 합침"""
+    """종목의 market 값에 따라 국내(네이버) / 미국(yfinance) / 코인(코인게코)으로 나눠서 조회 후 합침"""
     kr_tickers = [w["ticker"] for w in watchlist if w.get("market", "KR") == "KR"]
     us_tickers = [w["ticker"] for w in watchlist if w.get("market", "KR") == "US"]
-    coin_tickers = [w["ticker"] for w in watchlist if w.get("market", "KR") == "COIN"]
+    coin_ids = [w["coin_id"] for w in watchlist if w.get("market", "KR") == "COIN" and w.get("coin_id")]
     prices = {}
     prices.update(get_current_prices_kr(kr_tickers))
     prices.update(get_current_prices_us(us_tickers))
-    prices.update(get_current_prices_binance(coin_tickers))
+    prices.update(get_current_prices_coingecko(coin_ids))
     return prices
 
 
@@ -225,54 +246,64 @@ def get_history_us(ticker, lookback_days):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_history_binance(ticker, lookback_days):
-    """바이낸스 일봉(1d 캔들) 데이터 조회 (최대 1000개)"""
-    limit = min(lookback_days * 2 + 30, 1000)
-    url = "https://api.binance.com/api/v3/klines"
+def get_history_coingecko(coin_id, lookback_days):
+    """코인게코 일별 가격 데이터 조회.
+    (코인게코 무료 API는 시가/고가/저가를 따로 안 주기 때문에, '고점'은 이 일별
+    가격들의 최고값으로 근사한다 - 장중 고점보다는 약간 낮게 잡힐 수 있음)"""
+    days = min(lookback_days * 2 + 30, 365)
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
     try:
         resp = requests.get(
-            url, params={"symbol": ticker, "interval": "1d", "limit": limit}, timeout=5
+            url,
+            params={"vs_currency": "usd", "days": days},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
         )
-        data = resp.json()
+        prices = resp.json().get("prices", [])
     except Exception:
         return pd.DataFrame()
 
-    if not isinstance(data, list) or not data:
+    if not prices:
         return pd.DataFrame()
 
-    df = pd.DataFrame(
-        data,
-        columns=[
-            "open_time", "open", "high", "low", "close", "volume", "close_time",
-            "quote_asset_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore",
-        ],
-    )
-    df["close"] = df["close"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["date"] = pd.to_datetime(df["open_time"], unit="ms")
-    df = df.set_index("date")
+    df = pd.DataFrame(prices, columns=["timestamp", "close"])
+    df["date"] = pd.to_datetime(df["timestamp"], unit="ms").dt.strftime("%Y-%m-%d")
+    df = df.groupby("date").last()  # 하루에 여러 값이 있으면 그날의 마지막 값만 사용
+    df.index = pd.to_datetime(df.index)
+    df["high"] = df["close"]  # 무료 API 한계로 종가를 고가의 근사치로 사용
 
-    # 코인은 24시간 거래라 '오늘'을 UTC 자정 기준으로 판단해서 미확정 캔들을 제외한다.
     today_str = datetime.utcnow().strftime("%Y-%m-%d")
     df = df[df.index.strftime("%Y-%m-%d") != today_str]
     return df[["close", "high"]]
 
 
-def get_history(ticker, market, lookback_days):
+
+def get_data_id(item):
+    """실제 데이터 조회에 쓸 식별자. 코인은 coin_id, 그 외에는 ticker."""
+    if item.get("market", "KR") == "COIN":
+        return item.get("coin_id")
+    return item["ticker"]
+
+
+def get_history(data_id, market, lookback_days):
     if market == "KR":
-        return get_history_kr(ticker, lookback_days)
+        return get_history_kr(data_id, lookback_days)
     if market == "COIN":
-        return get_history_binance(ticker, lookback_days)
-    return get_history_us(ticker, lookback_days)
+        return get_history_coingecko(data_id, lookback_days)
+    return get_history_us(data_id, lookback_days)
 
 
 def get_reference_value(item):
     """조건별 '기준값' 계산 (이평값, 직전 고점, 목표가)"""
     condition = item["condition"]
     market = item.get("market", "KR")
+    data_id = get_data_id(item)
 
     if condition == "target_price":
         return item["target_price"]
+
+    if not data_id:
+        return None
 
     if condition == "ma_touch":
         period = item["ma_period"]
@@ -286,7 +317,7 @@ def get_reference_value(item):
         else:
             fetch_days = period
 
-        df = get_history(item["ticker"], market, fetch_days)
+        df = get_history(data_id, market, fetch_days)
         if df.empty or len(df) < period:
             return None
 
@@ -296,7 +327,7 @@ def get_reference_value(item):
 
     if condition == "prior_high":
         period = item["lookback_days"]
-        df = get_history(item["ticker"], market, period)
+        df = get_history(data_id, market, period)
         if df.empty:
             return None
         recent = df.iloc[-period:] if len(df) >= period else df
@@ -371,10 +402,12 @@ elif market_code == "US":
     st.sidebar.caption("예: 애플=AAPL, 테슬라=TSLA, 엔비디아=NVDA")
     ticker_input = st.sidebar.text_input("티커(symbol)", key="ticker_box_us")
 else:
-    st.sidebar.caption("코인 이름만 입력하면 바이낸스 USDT 마켓 시세를 가져와요. 예: BTC, ETH, SOL")
-    ticker_input = st.sidebar.text_input("코인 심볼", key="ticker_box_coin")
+    st.sidebar.caption("코인 이름이나 심볼을 입력하면 코인게코에서 찾아줘요. 예: BTC, ETH, HYPE")
+    ticker_input = st.sidebar.text_input("코인 심볼/이름", key="ticker_box_coin")
 
 name_input = st.sidebar.text_input("표시할 종목명 (자유롭게 입력)", key="name_box")
+
+coin_match = None
 
 if ticker_input:
     ticker_clean = ticker_input.strip()
@@ -387,14 +420,16 @@ if ticker_input:
         invalid_msg = "영문 티커를 입력해주세요. (예: AAPL, TSLA)"
     else:  # COIN
         ticker_clean = ticker_clean.upper()
-        if not ticker_clean.endswith("USDT"):
-            ticker_clean = f"{ticker_clean}USDT"
-        valid_code = True
-        invalid_msg = ""
+        coin_match = search_coingecko_id(ticker_clean)
+        valid_code = coin_match is not None
+        invalid_msg = "코인을 찾을 수 없어요. 심볼이나 이름을 다시 확인해주세요."
 
     if not valid_code:
         st.sidebar.warning(invalid_msg)
     else:
+        if coin_match:
+            st.sidebar.caption(f"✅ 인식된 코인: {coin_match['name']} ({coin_match['symbol'].upper()})")
+
         display_name = name_input.strip() if name_input.strip() else ticker_clean
 
         condition_type = st.sidebar.selectbox(
@@ -409,6 +444,8 @@ if ticker_input:
             "market": market_code,
             "condition": condition_type,
         }
+        if market_code == "COIN" and coin_match:
+            new_item["coin_id"] = coin_match["id"]
 
         if condition_type == "ma_touch":
             new_item["ma_period"] = st.sidebar.number_input("이동평균 기간(일)", 5, 300, 50)
@@ -424,7 +461,7 @@ if ticker_input:
                 "근접 기준(±%)", 0.1, 10.0, 1.0
             )
         elif condition_type == "target_price":
-            price_label = {"KR": "목표가(원)", "US": "목표가($)", "COIN": "목표가(USDT)"}[
+            price_label = {"KR": "목표가(원)", "US": "목표가($)", "COIN": "목표가($)"}[
                 market_code
             ]
             new_item["target_price"] = st.sidebar.number_input(
@@ -473,7 +510,8 @@ else:
     for item in watchlist:
         ticker = item["ticker"]
         market = item.get("market", "KR")
-        price_info = prices.get(ticker, {})
+        data_id = get_data_id(item)
+        price_info = prices.get(data_id, {}) if data_id else {}
         current = price_info.get("price")
         market_status = price_info.get("market_status", "-")
         ref = get_reference_value(item)
