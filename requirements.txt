@@ -3,3 +3,4 @@ pykrx
 pandas
 requests
 yfinance
+altair

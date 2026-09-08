@@ -25,11 +25,12 @@ pip install streamlit pykrx pandas requests yfinance
 - 이동평균/직전 고점: 전일까지의 일봉(종가/고가) 기준으로 계산됩니다.
 """
 
+import base64
 import json
 import os
-import time
 from datetime import datetime, timedelta
 
+import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
@@ -50,6 +51,7 @@ CONDITION_NAMES = {
     "ma_touch": "이동평균선 근접",
     "prior_high": "직전 고점 돌파",
     "target_price": "목표가 도달",
+    "trend_break": "추세선 돌파",
 }
 
 CURRENCY_SYMBOL = {"KR": "원", "US": "$", "COIN": "$"}
@@ -67,7 +69,11 @@ def format_price(value, market):
 
 
 # ==================================================================
-# 저장 / 불러오기 (재실행해도 설정이 유지되도록)
+# 저장 / 불러오기
+# 로컬 실행: 그냥 파일로 저장 (재실행해도 유지됨)
+# 클라우드 실행: 로컬 파일은 언제든 초기화될 수 있으므로, GitHub Secrets에
+# github_token / github_repo 가 설정되어 있으면 GitHub 저장소 안의 파일에
+# 직접 저장해서 앱이 잠들었다 깨어나도 데이터가 유지되게 한다.
 # ==================================================================
 def load_json(path, default):
     if os.path.exists(path):
@@ -84,10 +90,78 @@ def save_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def get_secret(key, default=""):
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+GITHUB_TOKEN = get_secret("github_token")
+GITHUB_REPO = get_secret("github_repo")  # 예: "hi403799-sketch/stock-dashboard"
+
+
+def github_configured():
+    return bool(GITHUB_TOKEN and GITHUB_REPO)
+
+
+def github_headers():
+    return {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+
+
+def github_get_file(path):
+    """GitHub 저장소에서 파일을 읽어온다. (내용, sha) 튜플, 없으면 (None, None)"""
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+    try:
+        resp = requests.get(url, headers=github_headers(), timeout=10)
+        if resp.status_code != 200:
+            return None, None
+        data = resp.json()
+        content = json.loads(base64.b64decode(data["content"]).decode("utf-8"))
+        return content, data["sha"]
+    except Exception:
+        return None, None
+
+
+def github_put_file(path, content_dict, message):
+    """GitHub 저장소의 파일을 새 내용으로 커밋한다."""
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+    _, sha = github_get_file(path)
+    body = {
+        "message": message,
+        "content": base64.b64encode(
+            json.dumps(content_dict, ensure_ascii=False, indent=2).encode("utf-8")
+        ).decode("utf-8"),
+        "branch": "main",
+    }
+    if sha:
+        body["sha"] = sha
+    try:
+        requests.put(url, headers=github_headers(), json=body, timeout=10)
+    except Exception:
+        pass
+
+
+def load_persistent(path, default):
+    if github_configured():
+        content, _ = github_get_file(path)
+        return content if content is not None else default
+    return load_json(path, default)
+
+
+def save_persistent(path, data):
+    if github_configured():
+        github_put_file(path, data, message=f"update {path}")
+    else:
+        save_json(path, data)
+
+
 if "watchlist" not in st.session_state:
-    st.session_state.watchlist = load_json(WATCHLIST_FILE, [])
+    st.session_state.watchlist = load_persistent(WATCHLIST_FILE, [])
 if "config" not in st.session_state:
-    st.session_state.config = load_json(CONFIG_FILE, {"ntfy_topic": "", "coingecko_api_key": ""})
+    st.session_state.config = load_persistent(
+        CONFIG_FILE, {"ntfy_topic": "", "coingecko_api_key": ""}
+    )
 if "notified" not in st.session_state:
     st.session_state.notified = {}  # 중복 알림 방지용: {종목+조건 키: 이미 달성 여부}
 
@@ -146,10 +220,7 @@ def get_current_prices_us(tickers):
 
 def get_secret_coingecko_key():
     """Streamlit Cloud의 Secrets에 저장된 키가 있으면 반환 (재배포/재시작해도 안 사라짐)"""
-    try:
-        return st.secrets.get("coingecko_api_key", "")
-    except Exception:
-        return ""
+    return get_secret("coingecko_api_key")
 
 
 def get_coingecko_headers():
@@ -330,6 +401,24 @@ def get_reference_value(item):
     if condition == "target_price":
         return item["target_price"]
 
+    if condition == "trend_break":
+        # 두 점(날짜+가격)을 지나는 직선을 오늘 날짜까지 연장한 값을 계산한다.
+        try:
+            d1 = datetime.strptime(item["point1_date"], "%Y-%m-%d").date()
+            d2 = datetime.strptime(item["point2_date"], "%Y-%m-%d").date()
+            p1 = item["point1_price"]
+            p2 = item["point2_price"]
+        except (KeyError, ValueError):
+            return None
+
+        days_total = (d2 - d1).days
+        if days_total == 0:
+            return None
+
+        slope = (p2 - p1) / days_total
+        days_to_today = (datetime.now().date() - d1).days
+        return p1 + slope * days_to_today
+
     if not data_id:
         return None
 
@@ -364,6 +453,19 @@ def get_reference_value(item):
     return None
 
 
+def get_external_chart_url(item):
+    """네이버금융/야후파이낸스/코인게코 등 외부 차트 페이지 주소를 만든다."""
+    market = item.get("market", "KR")
+    if market == "KR":
+        return f"https://finance.naver.com/item/main.naver?code={item['ticker']}"
+    if market == "US":
+        return f"https://finance.yahoo.com/quote/{item['ticker']}"
+    if market == "COIN":
+        coin_id = item.get("coin_id", "")
+        return f"https://www.coingecko.com/en/coins/{coin_id}" if coin_id else ""
+    return ""
+
+
 def get_condition_label(item):
     """표에 표시할 조건 설명 문구를 만든다."""
     condition = item["condition"]
@@ -374,6 +476,9 @@ def get_condition_label(item):
         return f"최근 {item['lookback_days']}일 고점 돌파"
     if condition == "target_price":
         return f"목표가 {format_price(item['target_price'], market)}"
+    if condition == "trend_break":
+        direction = "상향 돌파" if item.get("trend_direction", "above") == "above" else "하향 이탈"
+        return f"추세선 {direction}"
     return CONDITION_NAMES.get(condition, condition)
 
 
@@ -381,7 +486,7 @@ def get_condition_label(item):
 # 알림 전송 (ntfy.sh)
 # ==================================================================
 def send_notification(item, current, ref, diff_pct):
-    topic = st.session_state.config.get("ntfy_topic", "").strip()
+    topic = (get_secret("ntfy_topic") or st.session_state.config.get("ntfy_topic", "")).strip()
     if not topic:
         return
     market = item.get("market", "KR")
@@ -405,12 +510,19 @@ def send_notification(item, current, ref, diff_pct):
 # 사이드바: 알림 설정
 # ==================================================================
 st.sidebar.header("🔔 알림 설정")
-topic_input = st.sidebar.text_input(
-    "ntfy 토픽 이름", value=st.session_state.config.get("ntfy_topic", "")
-)
-if topic_input != st.session_state.config.get("ntfy_topic"):
-    st.session_state.config["ntfy_topic"] = topic_input
-    save_json(CONFIG_FILE, st.session_state.config)
+if get_secret("ntfy_topic"):
+    st.sidebar.success("✅ Secrets에 저장된 토픽을 사용 중이에요. (재배포해도 유지됨)")
+else:
+    st.sidebar.caption(
+        "GitHub 저장소를 공개(Public)로 쓰고 있다면, 토픽 이름이 코드에 저장되지 않도록 "
+        "Streamlit Secrets에 ntfy_topic 으로 등록하는 걸 추천해요."
+    )
+    topic_input = st.sidebar.text_input(
+        "ntfy 토픽 이름", value=st.session_state.config.get("ntfy_topic", "")
+    )
+    if topic_input != st.session_state.config.get("ntfy_topic"):
+        st.session_state.config["ntfy_topic"] = topic_input
+        save_persistent(CONFIG_FILE, st.session_state.config)
 
 st.sidebar.header("🪙 코인 시세 설정")
 st.sidebar.caption(
@@ -428,7 +540,7 @@ else:
     )
     if coingecko_key_input != st.session_state.config.get("coingecko_api_key"):
         st.session_state.config["coingecko_api_key"] = coingecko_key_input
-        save_json(CONFIG_FILE, st.session_state.config)
+        save_persistent(CONFIG_FILE, st.session_state.config)
 
 # ==================================================================
 # 사이드바: 종목 추가
@@ -516,10 +628,43 @@ if ticker_input:
             new_item["threshold_pct"] = st.sidebar.number_input(
                 "근접 기준(±%)", 0.1, 10.0, 1.0
             )
+        elif condition_type == "trend_break":
+            st.sidebar.caption(
+                "차트에서 추세선을 그을 두 점의 날짜와 가격을 입력하세요. "
+                "(예: 상승 지지선이면 저점 2개, 하락 저항선이면 고점 2개)"
+            )
+            price_label = {"KR": "가격(원)", "US": "가격($)", "COIN": "가격($)"}[market_code]
+
+            col_a, col_b = st.sidebar.columns(2)
+            point1_date = col_a.date_input("점1 날짜", key="trend_p1_date")
+            point1_price = col_b.number_input(
+                price_label + " (점1)", min_value=0.0, step=1.0, key="trend_p1_price"
+            )
+            point2_date = col_a.date_input("점2 날짜", key="trend_p2_date")
+            point2_price = col_b.number_input(
+                price_label + " (점2)", min_value=0.0, step=1.0, key="trend_p2_price"
+            )
+
+            new_item["point1_date"] = point1_date.strftime("%Y-%m-%d")
+            new_item["point1_price"] = point1_price
+            new_item["point2_date"] = point2_date.strftime("%Y-%m-%d")
+            new_item["point2_price"] = point2_price
+
+            new_item["trend_direction"] = (
+                "above"
+                if st.sidebar.radio(
+                    "돌파 방향", ["상향 돌파 (저항선 위로)", "하향 이탈 (지지선 아래로)"]
+                )
+                == "상향 돌파 (저항선 위로)"
+                else "below"
+            )
+            new_item["threshold_pct"] = st.sidebar.number_input(
+                "근접 기준(±%, 참고용)", 0.1, 10.0, 1.0
+            )
 
         if st.sidebar.button("이 조건으로 추가"):
             st.session_state.watchlist.append(new_item)
-            save_json(WATCHLIST_FILE, st.session_state.watchlist)
+            save_persistent(WATCHLIST_FILE, st.session_state.watchlist)
             st.sidebar.success(f"{display_name} 추가 완료!")
             st.rerun()
 
@@ -534,22 +679,81 @@ if st.session_state.watchlist:
         col1.write(f"{flag} {item['name']} · {get_condition_label(item)}")
         if col2.button("삭제", key=f"del_{i}"):
             st.session_state.watchlist.pop(i)
-            save_json(WATCHLIST_FILE, st.session_state.watchlist)
+            save_persistent(WATCHLIST_FILE, st.session_state.watchlist)
             st.rerun()
 
-auto_refresh_on = st.sidebar.checkbox("자동 새로고침 켜기", value=True)
 if st.sidebar.button("🔄 지금 새로고침"):
     st.rerun()
 
 # ==================================================================
 # 메인 화면: 조건 모니터링 표
+# 표 부분만 주기적으로 새로고침되도록 fragment로 분리해서,
+# 사이드바에서 종목을 입력/추가하는 동안 화면이 멈추지 않게 한다.
 # ==================================================================
 st.title("📈 관심종목 조건 모니터")
 
-watchlist = st.session_state.watchlist
-if not watchlist:
-    st.info("왼쪽 사이드바에서 종목을 검색해 추가해보세요.")
-else:
+
+def render_item_chart(item):
+    """선택한 종목의 가격 차트와 조건 기준선을 함께 보여준다."""
+    market = item.get("market", "KR")
+    data_id = get_data_id(item)
+    if not data_id:
+        st.info("차트를 표시할 데이터가 없어요.")
+        return
+
+    df = get_history(data_id, market, 300)
+    if df.empty:
+        st.info("차트 데이터를 가져오지 못했어요.")
+        return
+
+    sub = df[["close"]].reset_index()
+    sub.columns = ["date", "close"]
+
+    line = alt.Chart(sub).mark_line(color="#4C78A8").encode(
+        x=alt.X("date:T", title=None),
+        y=alt.Y("close:Q", title="가격", scale=alt.Scale(zero=False)),
+        tooltip=[alt.Tooltip("date:T", title="날짜"), alt.Tooltip("close:Q", title="종가", format=",.2f")],
+    )
+    layers = [line]
+
+    if item["condition"] == "trend_break":
+        # 추세선은 두 점을 지나는 대각선 그대로 그려준다.
+        try:
+            d1 = datetime.strptime(item["point1_date"], "%Y-%m-%d")
+            p1 = item["point1_price"]
+            p2 = item["point2_price"]
+            d2 = datetime.strptime(item["point2_date"], "%Y-%m-%d")
+            days_total = (d2 - d1).days
+            if days_total != 0:
+                slope = (p2 - p1) / days_total
+                trend_df = sub[["date"]].copy()
+                trend_df["trend_value"] = trend_df["date"].apply(
+                    lambda d: p1 + slope * (d.to_pydatetime().date() - d1.date()).days
+                )
+                trend_line = alt.Chart(trend_df).mark_line(
+                    color="orange", strokeDash=[4, 4]
+                ).encode(x="date:T", y="trend_value:Q")
+                layers.append(trend_line)
+        except (KeyError, ValueError):
+            pass
+    else:
+        ref_val = get_reference_value(item)
+        if ref_val is not None:
+            ref_df = pd.DataFrame({"y": [ref_val]})
+            rule = alt.Chart(ref_df).mark_rule(color="red", strokeDash=[4, 4]).encode(y="y:Q")
+            layers.append(rule)
+
+    st.altair_chart(alt.layer(*layers).properties(height=320), use_container_width=True)
+    st.caption(f"점선: {get_condition_label(item)} 기준선  ·  외부에서 보기: [{item['name']}]({get_external_chart_url(item)})")
+
+
+@st.fragment(run_every=AUTO_REFRESH_SECONDS)
+def render_watchlist_table():
+    watchlist = st.session_state.watchlist
+    if not watchlist:
+        st.info("왼쪽 사이드바에서 종목을 검색해 추가해보세요.")
+        return
+
     prices = get_current_prices(watchlist)
 
     rows = []
@@ -572,6 +776,11 @@ else:
             achieved = False
         elif item["condition"] == "prior_high":
             achieved = diff_pct >= 0
+        elif item["condition"] == "trend_break":
+            if item.get("trend_direction", "above") == "above":
+                achieved = diff_pct >= 0  # 추세선 위로 상향 돌파
+            else:
+                achieved = diff_pct <= 0  # 추세선 아래로 하향 이탈
         else:
             achieved = abs(diff_pct) <= threshold
 
@@ -594,16 +803,29 @@ else:
                 "기준값": format_price(ref, market),
                 "차이": f"{diff_pct:+.2f}%" if diff_pct is not None else "-",
                 "상태": "🔔 조건 도달" if achieved else "관찰중",
+                "외부차트": get_external_chart_url(item),
             }
         )
 
     df_display = pd.DataFrame(rows)
-    st.dataframe(df_display, use_container_width=True, hide_index=True)
+    st.caption("표에서 종목을 클릭하면 아래에 가격 차트가 표시돼요.")
+    event = st.dataframe(
+        df_display,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        column_config={
+            "외부차트": st.column_config.LinkColumn("외부차트", display_text="🔗 열기"),
+        },
+    )
     st.caption(f"마지막 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-# ==================================================================
-# 자동 새로고침
-# ==================================================================
-if auto_refresh_on:
-    time.sleep(AUTO_REFRESH_SECONDS)
-    st.rerun()
+    selected_rows = event.selection.rows if event and event.selection else []
+    if selected_rows:
+        selected_item = watchlist[selected_rows[0]]
+        st.subheader(f"📊 {selected_item['name']} 차트")
+        render_item_chart(selected_item)
+
+
+render_watchlist_table()
