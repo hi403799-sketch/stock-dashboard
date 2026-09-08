@@ -28,5 +28,14 @@
     "ma_period": 65,
     "ma_type": "EMA",
     "threshold_pct": 1.0
+  },
+  {
+    "ticker": "NVT",
+    "name": "Nvt",
+    "market": "US",
+    "condition": "ma_touch",
+    "ma_period": 120,
+    "ma_type": "SMA",
+    "threshold_pct": 1.0
   }
 ]
