@@ -7,5 +7,17 @@
     "ma_period": 200,
     "ma_type": "SMA",
     "threshold_pct": 1.0
+  },
+  {
+    "ticker": "GOOGL",
+    "name": "구글",
+    "market": "US",
+    "condition": "trend_break",
+    "point1_date": "2026-05-13",
+    "point1_price": 403.2,
+    "point2_date": "2026-07-16",
+    "point2_price": 375.03,
+    "trend_direction": "above",
+    "threshold_pct": 1.0
   }
 ]
