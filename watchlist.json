@@ -1,0 +1,11 @@
+[
+  {
+    "ticker": "AMZN",
+    "name": "아마존",
+    "market": "US",
+    "condition": "ma_touch",
+    "ma_period": 200,
+    "ma_type": "SMA",
+    "threshold_pct": 1.0
+  }
+]
