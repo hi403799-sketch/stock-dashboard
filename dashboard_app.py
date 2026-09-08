@@ -34,6 +34,7 @@ import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 from pykrx import stock
 
@@ -453,16 +454,30 @@ def get_reference_value(item):
     return None
 
 
+def get_tradingview_symbol(item):
+    """트레이딩뷰 차트 위젯/페이지에 넣을 심볼 문자열을 만든다.
+    - 국내: KRX:005930
+    - 미국: AAPL (심볼만 넣으면 트레이딩뷰가 거래소를 자동 인식)
+    - 코인: CRYPTO:BTCUSD (여러 거래소 통합 지수)
+    """
+    market = item.get("market", "KR")
+    ticker = (item.get("ticker") or "").strip()
+    if market == "KR":
+        return f"KRX:{ticker}"
+    if market == "COIN":
+        return f"CRYPTO:{ticker.upper()}USD"
+    return ticker.upper()
+
+
 def get_external_chart_url(item):
-    """네이버금융/야후파이낸스/코인게코 등 외부 차트 페이지 주소를 만든다."""
+    """외부 차트 페이지 주소를 만든다. (미국 주식/코인은 트레이딩뷰)"""
     market = item.get("market", "KR")
     if market == "KR":
         return f"https://finance.naver.com/item/main.naver?code={item['ticker']}"
     if market == "US":
-        return f"https://finance.yahoo.com/quote/{item['ticker']}"
+        return f"https://www.tradingview.com/symbols/{item['ticker']}/"
     if market == "COIN":
-        coin_id = item.get("coin_id", "")
-        return f"https://www.coingecko.com/en/coins/{coin_id}" if coin_id else ""
+        return f"https://www.tradingview.com/symbols/{get_tradingview_symbol(item)}/"
     return ""
 
 
@@ -693,8 +708,73 @@ if st.sidebar.button("🔄 지금 새로고침"):
 st.title("📈 관심종목 조건 모니터")
 
 
+def render_tradingview_chart(item):
+    """트레이딩뷰 고급 차트 위젯을 임베드한다. (캔들 + 이동평균선 + 각종 도구)"""
+    symbol = get_tradingview_symbol(item)
+    market = item.get("market", "KR")
+
+    # 이동평균선: 기본 20/60/120일. ma_touch 조건이면 그 기간/종류를 추가로 표시.
+    ma_lengths = {20, 60, 120}
+    ma_study_id = "MASimple@tv-basicstudies"
+    if item.get("condition") == "ma_touch":
+        ma_lengths.add(int(item.get("ma_period", 50)))
+        if item.get("ma_type") == "EMA":
+            ma_study_id = "MAExp@tv-basicstudies"
+    studies = [{"id": ma_study_id, "inputs": {"length": n}} for n in sorted(ma_lengths)]
+
+    container_id = (
+        f"tv_{market}_{item.get('ticker', '')}".replace(".", "_").replace("-", "_")
+    )
+    config = {
+        "autosize": True,
+        "symbol": symbol,
+        "interval": "D",
+        "timezone": "Asia/Seoul",
+        "theme": "light",
+        "style": "1",  # 1=캔들, 0=바, 3=라인
+        "locale": "kr",
+        "enable_publishing": False,
+        "allow_symbol_change": True,
+        "hide_side_toolbar": False,
+        "withdateranges": True,
+        "studies": studies,
+        "container_id": container_id,
+    }
+    html = f"""
+    <div class="tradingview-widget-container" style="height:520px;width:100%">
+      <div id="{container_id}" style="height:100%;width:100%"></div>
+      <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+      <script type="text/javascript">
+        new TradingView.widget({json.dumps(config)});
+      </script>
+    </div>
+    """
+    components.html(html, height=540)
+
+    ref_val = None if item["condition"] == "trend_break" else get_reference_value(item)
+    if ref_val is not None:
+        st.caption(
+            f"참고 · {get_condition_label(item)} 기준값: "
+            f"**{format_price(ref_val, market)}** "
+            f"(트레이딩뷰 차트에는 표시되지 않아요 — 아래 '조건 기준선 차트'에서 확인하세요)"
+        )
+    st.caption(
+        f"차트가 안 뜨면 심볼(`{symbol}`)을 트레이딩뷰가 인식하지 못하는 경우예요. "
+        f"위젯 상단에서 직접 심볼을 바꿔보세요.  ·  "
+        f"외부에서 보기: [{item['name']}]({get_external_chart_url(item)})"
+    )
+
+
 def render_item_chart(item):
-    """선택한 종목의 가격 차트와 조건 기준선을 함께 보여준다."""
+    """선택한 종목의 차트를 보여준다.
+    기본은 트레이딩뷰(캔들/이평선), 접힌 영역에 조건 기준선이 표시된 간단 차트."""
+    render_tradingview_chart(item)
+    with st.expander("📐 조건 기준선 차트 보기 (이평/목표가/고점/추세선)"):
+        render_condition_line_chart(item)
+
+
+def render_condition_line_chart(item):
+    """종가 라인 + 조건 기준선(빨간 점선)을 함께 보여준다."""
     market = item.get("market", "KR")
     data_id = get_data_id(item)
     if not data_id:
