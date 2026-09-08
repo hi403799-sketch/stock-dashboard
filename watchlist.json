@@ -19,5 +19,14 @@
     "point2_price": 375.03,
     "trend_direction": "above",
     "threshold_pct": 1.0
+  },
+  {
+    "ticker": "KO",
+    "name": "코카콜라",
+    "market": "US",
+    "condition": "ma_touch",
+    "ma_period": 65,
+    "ma_type": "EMA",
+    "threshold_pct": 1.0
   }
 ]
