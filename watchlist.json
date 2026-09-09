@@ -55,13 +55,5 @@
     "ma_period": 65,
     "ma_type": "EMA",
     "threshold_pct": 1.0
-  },
-  {
-    "ticker": "NEO",
-    "name": "Neo",
-    "market": "US",
-    "condition": "prior_high",
-    "lookback_days": 252,
-    "threshold_pct": 1.0
   }
 ]
