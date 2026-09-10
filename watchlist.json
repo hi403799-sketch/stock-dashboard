@@ -89,5 +89,17 @@
     "condition": "target_price",
     "target_price": 85.25,
     "threshold_pct": 1.0
+  },
+  {
+    "ticker": "TARS",
+    "name": "Tars",
+    "market": "US",
+    "condition": "trend_break",
+    "point1_date": "2023-10-17",
+    "point1_price": 13.15,
+    "point2_date": "2026-06-03",
+    "point2_price": 56.0,
+    "trend_direction": "above",
+    "threshold_pct": 1.0
   }
 ]
