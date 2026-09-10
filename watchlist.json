@@ -101,5 +101,14 @@
     "point2_price": 56.0,
     "trend_direction": "above",
     "threshold_pct": 1.0
+  },
+  {
+    "ticker": "MPC",
+    "name": "Mpc",
+    "market": "US",
+    "condition": "ma_touch",
+    "ma_period": 65,
+    "ma_type": "EMA",
+    "threshold_pct": 1.0
   }
 ]
