@@ -72,5 +72,14 @@
     "ma_period": 200,
     "ma_type": "SMA",
     "threshold_pct": 1.0
+  },
+  {
+    "ticker": "NTRA",
+    "name": "나테라",
+    "market": "US",
+    "condition": "ma_touch",
+    "ma_period": 200,
+    "ma_type": "SMA",
+    "threshold_pct": 1.0
   }
 ]
