@@ -63,5 +63,14 @@
     "condition": "target_price",
     "target_price": 21.22,
     "threshold_pct": 1.0
+  },
+  {
+    "ticker": "LLY",
+    "name": "Lly",
+    "market": "US",
+    "condition": "ma_touch",
+    "ma_period": 200,
+    "ma_type": "SMA",
+    "threshold_pct": 1.0
   }
 ]
